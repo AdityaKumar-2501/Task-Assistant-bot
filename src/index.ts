@@ -1,4 +1,5 @@
 import { Telegraf } from "telegraf";
+import http from "node:http";
 
 import { config } from "./config.js";
 import { connectDb } from "./db.js";
@@ -791,9 +792,43 @@ bot.on("text", ctx => {
 });
 
 /**
+ * HEALTH CHECK SERVER
+ * ------------------------------------------------------------
+ * This bot talks to Telegram via long polling — it never opens a
+ * port on its own. Render's free "Web Service" tier expects the
+ * process to bind to $PORT and will eventually mark the deploy
+ * unhealthy/exit it if nothing ever does ("No open ports
+ * detected"). This tiny server exists purely to satisfy that
+ * check; it isn't used by Telegram, the agent, or anything else
+ * in the app.
+ *
+ * If you move this service to a Render "Background Worker" (paid
+ * plans only) instead of "Web Service", this server is no longer
+ * needed and can be removed along with the call to it in main().
+ */
+function startHealthServer() {
+  const port = Number(process.env.PORT) || 3000;
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("OK");
+  });
+
+  server.listen(port, () => {
+    console.log(`Health check server listening on port ${port}`);
+  });
+
+  return server;
+}
+
+/**
  * Start application
  */
 async function main() {
+  // Bind a port immediately so Render's health check passes even
+  // if connectDb() or bot.launch() below take a moment.
+  startHealthServer();
+
   await connectDb();
 
   // Register Telegram "/" command menu.
