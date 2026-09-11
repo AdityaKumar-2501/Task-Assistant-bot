@@ -24,6 +24,49 @@ import {
 
 const bot = new Telegraf(config.telegramToken);
 
+/**
+ * PER-USER MESSAGE QUEUE
+ * ------------------------------------------------------------
+ * The natural-language handler doesn't block Telegraf's update
+ * loop (see bot.on("text", ...) below), so messages from
+ * DIFFERENT users are processed concurrently — that's the point,
+ * it's what keeps one slow Gemini call from delaying everyone
+ * else.
+ *
+ * But within a SINGLE user's messages, order still matters (e.g.
+ * "add a task" then "clear all tasks" sent seconds apart should
+ * run in that order, not race each other). This map holds one
+ * promise chain per userId: each new message for a user is
+ * appended to that user's chain and only starts once their
+ * previous message has finished. Different users get independent
+ * chains, so they never wait on each other.
+ */
+const userQueues = new Map<number, Promise<void>>();
+
+function enqueueForUser(
+  userId: number,
+  task: () => Promise<void>
+): Promise<void> {
+  const previous = userQueues.get(userId) ?? Promise.resolve();
+
+  // Swallow a previous failure so one bad message doesn't
+  // permanently stall this user's queue.
+  const next = previous.catch(() => {}).then(task);
+
+  userQueues.set(userId, next);
+
+  // Once this task settles, drop the entry if nothing newer has
+  // been queued behind it, so the map doesn't grow forever for
+  // users who go quiet.
+  next.finally(() => {
+    if (userQueues.get(userId) === next) {
+      userQueues.delete(userId);
+    }
+  });
+
+  return next;
+}
+
 
 function formatTime(date: Date) {
   return new Intl.DateTimeFormat(
@@ -712,7 +755,7 @@ Completion rate: ${analytics.completionRate}%
  * Anything that isn't a Telegram command is handled
  * by the LangGraph + Gemini agent.
  */
-bot.on("text", async ctx => {
+bot.on("text", ctx => {
   const text = ctx.message.text.trim();
 
   // Ignore commands that were not explicitly handled above.
@@ -720,23 +763,31 @@ bot.on("text", async ctx => {
     return;
   }
 
-  try {
-    await ctx.sendChatAction("typing");
+  const userId = ctx.from.id;
+  const chatId = ctx.chat.id;
 
-    const response = await handleUserMessage({
-      userId: ctx.from.id,
-      chatId: ctx.chat.id,
-      message: text
-    });
+  // Does NOT await: Telegraf's update loop moves on to the next
+  // update immediately. Ordering for THIS user is still guaranteed
+  // by enqueueForUser — see the comment above userQueues.
+  void enqueueForUser(userId, async () => {
+    try {
+      await ctx.sendChatAction("typing");
 
-    await ctx.reply(response);
-  } catch (error) {
-    console.error("Error handling user message:", error);
+      const response = await handleUserMessage({
+        userId,
+        chatId,
+        message: text
+      });
 
-    await ctx.reply(
-      "Something went wrong while processing your request. Please try again."
-    );
-  }
+      await ctx.reply(response);
+    } catch (error) {
+      console.error("Error handling user message:", error);
+
+      await ctx.reply(
+        "Something went wrong while processing your request. Please try again."
+      );
+    }
+  });
 });
 
 /**

@@ -12,6 +12,7 @@
 - **Transport:** Telegram Bot API through Telegraf
 - **AI runtime:** LangChain/LangGraph with Google Gemini through `@langchain/google-genai`
 - **Persistence:** MongoDB
+- **Analytics:** Daily, weekly, and monthly productivity calculations in `src/analytics.ts`
 - **Background work:** `node-cron`, running in the same process as the Telegram bot
 - **HTTP API:** None. The public API is the Telegram bot interface. TypeScript functions and LangGraph tools are internal APIs.
 
@@ -26,7 +27,7 @@ Telegraf handlers in src/index.ts
     |
     `-- ordinary text -> handleUserMessage()
                          -> LangGraph agent
-                         -> model selects internal tools
+                         -> per-message tools with trusted user/chat identity
                          -> task/memory functions -> MongoDB
 
 The same process also runs two every-minute cron jobs:
@@ -34,7 +35,7 @@ The same process also runs two every-minute cron jobs:
     2. daily-review worker at configured local time -> Telegram message
 ```
 
-Business-critical task and memory mutations happen in application functions, not directly in model-generated text.
+Business-critical task and memory mutations happen in application functions, not directly in model-generated text. Ordinary messages are queued per user so that one user's messages are processed in order; different users can be processed concurrently.
 
 ## 3. Startup and Shutdown
 
@@ -43,8 +44,9 @@ Business-critical task and memory mutations happen in application functions, not
 1. Construct a Telegraf bot using `TELEGRAM_BOT_TOKEN`.
 2. Connect to MongoDB with `connectDb()`.
 3. Create the reminder and daily-summary schedulers with `startSchedulers(bot)`.
-4. Start Telegram long polling with `bot.launch()`.
-5. Stop the bot on `SIGINT` and `SIGTERM`.
+4. Register Telegram's command menu with `setMyCommands()`.
+5. Start Telegram long polling with `bot.launch()`.
+6. Stop the bot on `SIGINT` and `SIGTERM`.
 
 A startup failure is logged and exits the process with status 1. `connectDb()` creates indexes every time the process starts; MongoDB makes this idempotent.
 
@@ -56,7 +58,7 @@ The implementation reads environment variables in `src/config.ts` after loading 
 | --------------------------- | -------: | --------------------------- | ----------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN`        |      Yes | none                        | Telegram bot token                              |
 | `GEMINI_API_KEY`            |      Yes | none                        | Google Gemini API key                           |
-| `GEMINI_MODEL`              |       No | `gemini-3.6-flash`          | Gemini model name                               |
+| `GEMINI_MODEL`              |       No | `gemini-2.5-flash`          | Gemini model name                               |
 | `MONGODB_URI`               |       No | `mongodb://127.0.0.1:27017` | MongoDB connection URI                          |
 | `MONGODB_DB`                |       No | `personal_assistant`        | MongoDB database name                           |
 | `TIMEZONE`                  |       No | `Asia/Kolkata`              | Scheduler and display timezone                  |
@@ -84,8 +86,11 @@ interface Task {
   scheduledAt: Date;
   status: "pending" | "completed" | "skipped";
   completedAt?: Date;
+  skippedAt?: Date;
   reminderCount: number;
   lastRemindedAt?: Date;
+  forwardedFrom?: Date;
+  forwardCount?: number;
   createdAt: Date;
 }
 ```
@@ -94,7 +99,8 @@ Rules:
 
 - New tasks always start as `pending` with `reminderCount: 0`.
 - Completing a task sets `status: "completed"` and `completedAt`; it does not delete the task.
-- Skipping a task sets `status: "skipped"` and does not set `completedAt`.
+- Skipping a task sets `status: "skipped"` and `skippedAt`; it does not set `completedAt`.
+- `forwardedFrom` and `forwardCount` support unfinished-task carry-forward data, although no current Telegram handler performs a forward operation.
 - Only pending tasks can be completed, skipped, or snoozed.
 - Task matching by text is case-insensitive and uses exact title matching first, then substring matching in either direction.
 - Matching is scoped by `userId`, but task listing is sorted by `scheduledAt` ascending.
@@ -134,8 +140,10 @@ Memories are append-only. Reads return the newest records first and default to 2
 `connectDb()` creates these indexes:
 
 - `tasks`: `{ userId: 1, status: 1, scheduledAt: 1 }`
-- `tasks`: `{ status: 1, scheduledAt: 1 }`
-- `reminders`: `{ taskId: 1, sentAt: -1 }`
+- `tasks`: `{ userId: 1, status: 1, title: 1 }`
+- `tasks`: `{ userId: 1, createdAt: 1 }`
+- `reminders`: `{ userId: 1, sentAt: 1 }`
+- `reminders`: `{ taskId: 1, sentAt: 1 }`
 - `memories`: `{ userId: 1, createdAt: -1 }`
 
 The shared database accessor is `db()` from `src/db.ts`. Collections are named `tasks`, `reminders`, and `memories`.
@@ -144,11 +152,15 @@ The shared database accessor is `db()` from `src/db.ts`. Collections are named `
 
 ### `/start`
 
-Returns a help message describing task management, reminders, memories, ignored-reminder tracking, nightly review, and example natural-language requests.
+Returns a Markdown-formatted welcome message describing natural-language task management, reminders, progress, memories, and the command menu.
+
+### `/help`
+
+Returns Markdown-formatted usage guidance for tasks, memories, daily progress, and quick commands.
 
 ### `/tasks`
 
-Lists all pending tasks for `ctx.from.id`, ordered by scheduled time. Each item includes its title and a localized `en-IN` date/time formatted in `config.timezone`. If there are no pending tasks, replies `No pending tasks` with a celebration message.
+Lists all pending tasks for `ctx.from.id`, ordered by scheduled time. Each item includes its title and a localized `en-IN` medium date and short time formatted in `config.timezone`. Responses use Telegram Markdown. Database failures return a user-facing retrieval error.
 
 ### `/remember <content>`
 
@@ -166,30 +178,53 @@ Finds a pending task by exact or partial title match for the sender and marks it
 
 Finds a pending task by exact or partial title match for the sender and marks it skipped. With no task text, returns usage. If no match exists, reports that no pending task was found.
 
+### `/summary`
+
+Generates today's productivity review using `getDailyAnalytics()` and sends task counts, completion rate, completed task details, unfinished tasks, skipped tasks, reminder totals, timing, carry-forward count, and a threshold-based insight. Database or analytics failures return a user-facing error.
+
+### `/weekly`
+
+Generates the current Monday-Sunday productivity review using `getWeeklyAnalytics()` and `getWeeklyTrend()`. It includes planned, completed, skipped, incomplete, completion rate, on-time/late completion, ignored reminders, carry-forward count, a daily percentage trend, and a threshold-based insight.
+
+### `/monthly`
+
+Generates the current calendar-month review using `getMonthlyAnalytics()` and `getMonthlyTrend()`. It includes the same performance and discipline metrics as the weekly review plus a weekly percentage trend and monthly insight.
+
+### Telegram command menu
+
+Startup calls `setMyCommands()` with: `start`, `help`, `tasks`, `done`, `skip`, `remember`, `memories`, `summary`, `weekly`, and `monthly`.
+
 ### Ordinary text messages
 
 Non-command text is passed to `handleUserMessage({ userId, chatId, message })`. The handler sends a typing action, invokes the LangGraph agent, and replies with the extracted final model response. Messages beginning with `/` that are not handled as commands are ignored by the generic text handler.
 
-Errors in the generic handler are logged and produce `Something went wrong. Check the server logs.` Errors inside the agent are logged and produce `Sorry, I couldn't process that right now.`
+The generic handler does not await Telegraf's update callback. It enqueues ordinary messages by `ctx.from.id`: messages from one user run serially, while different users run concurrently. Errors in the generic handler are logged and produce `Something went wrong while processing your request. Please try again.` Errors inside the agent are logged and produce `Sorry, I couldn't process that right now.`
 
 ## 8. Natural-Language Agent API
 
-`src/agent.ts` creates a LangGraph agent with a Gemini model configured at temperature 0. The system prompt includes the current user ID, chat ID, current ISO timestamp, and configured timezone.
+`src/agent.ts` creates a fresh LangGraph agent for each non-fast ordinary message. It uses a Gemini model configured at temperature 0 with `maxOutputTokens: 300`. The system prompt includes the current user ID, chat ID, current ISO timestamp, and configured timezone.
+
+Short exact messages `hi`, `hello`, `hey`, `thanks`, `thank you`, `good morning`, and `good night` use local responses and do not call Gemini.
+
+Tool identity is data-isolated: `userId` and `chatId` are captured from trusted Telegram context in closures. They are not present in any model-controlled tool schema, preventing the model from selecting another user's identity.
 
 The agent is instructed to keep responses short, use tools for state changes, avoid claiming a mutation unless the tool succeeds, and not expose internal implementation details.
 
 ### Registered tools
 
-| Tool            | Input schema                                                                                   | Behavior                                                                                                                     |
-| --------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `list_tasks`    | `{ userId: number }`                                                                           | Returns all pending tasks, including title, MongoDB ID, ISO scheduled time, and reminder count.                              |
-| `add_task`      | `{ userId: number, chatId: number, title: string, scheduledAt: string, description?: string }` | Parses `scheduledAt` as a date and inserts a pending task. Requires a complete ISO-8601 timestamp including timezone offset. |
-| `complete_task` | `{ userId: number, taskText: string }`                                                         | Completes a matching pending task by title text.                                                                             |
-| `skip_task`     | `{ userId: number, taskText: string }`                                                         | Skips a matching pending task by title text.                                                                                 |
-| `remember`      | `{ userId: number, chatId: number, content: string }`                                          | Inserts a memory.                                                                                                            |
-| `get_memories`  | `{ userId: number }`                                                                           | Returns up to 20 recent memories.                                                                                            |
+| Tool                | Input schema                                                   | Behavior                                                                                                                                                    |
+| ------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_tasks`        | `{}`                                                           | Returns all pending tasks, including title, MongoDB ID, ISO scheduled time, and reminder count.                                                             |
+| `add_task`          | `{ title: string, scheduledAt: string, description?: string }` | Parses `scheduledAt` as a date and inserts a pending task using trusted closure identity. Requires a complete ISO-8601 timestamp including timezone offset. |
+| `complete_task`     | `{ taskText: string }`                                         | Completes a matching pending task by title text using trusted closure identity.                                                                             |
+| `skip_task`         | `{ taskText: string }`                                         | Skips a matching pending task by title text using trusted closure identity.                                                                                 |
+| `remember`          | `{ content: string }`                                          | Inserts a memory using trusted closure identity.                                                                                                            |
+| `get_memories`      | `{}`                                                           | Returns up to 20 recent memories for the trusted user.                                                                                                      |
+| `daily_analytics`   | `{}`                                                           | Returns today's productivity metrics as JSON.                                                                                                               |
+| `weekly_analytics`  | `{}`                                                           | Returns current-week metrics and daily trend as JSON.                                                                                                       |
+| `monthly_analytics` | `{}`                                                           | Returns current-month metrics and weekly trend as JSON.                                                                                                     |
 
-Task creation must not guess a time. If the user does not provide a time, the agent must ask for one. The prompt describes `Asia/Kolkata` as the user timezone, but the actual value supplied to the prompt is `config.timezone`.
+Task creation must not guess a time. If the user does not provide a time, the agent must ask for one. The tool description says `Asia/Kolkata`, while the runtime prompt supplies `config.timezone`. Analytics requests must use the matching analytics tool and present only returned statistics.
 
 ### Model response extraction
 
@@ -202,13 +237,13 @@ Task creation must not guess a time. If the user does not provide a time, the ag
 - `createTask(input)` validates `scheduledAt`, inserts a pending task, and returns it with the inserted `_id`.
 - `getPendingTasks(userId)` returns pending tasks ordered by `scheduledAt`.
 - `completeTask(userId, taskId)` updates one pending task owned by the user.
-- `findBestTaskForCompletion(userId, text)` performs exact-then-substring matching against pending titles.
+- `findBestTaskForCompletion(userId, text)` returns `null` for empty text, searches pending titles with escaped case-insensitive exact/substring regexes, sorts by `scheduledAt`, limits candidates to 10, and prefers an exact match.
 - `completeTaskByText(userId, text)` resolves a task and completes it, or returns `null`.
-- `skipTaskByText(userId, text)` resolves a task and skips it, or returns `null`.
+- `skipTaskByText(userId, text)` resolves a task and skips it, setting `skippedAt`, or returns `null`.
 - `snoozeTask(userId, taskId, minutes)` moves a pending task to `Date.now() + minutes * 60_000`.
 - `getDueTasks(now = new Date())` returns all pending tasks with `scheduledAt <= now`.
 - `markReminderSent(taskId)` increments `reminderCount`, sets `lastRemindedAt`, and inserts a reminder event.
-- `getTasksForDailySummary(userId, start, end)` returns tasks created before `end` whose scheduled or completed timestamp falls within `[start, end)`.
+- `getTasksForDailySummary(userId, start, end)` returns tasks created before `end` whose scheduled, completed, skipped, or forwarded timestamp falls within `[start, end)`.
 - `countIgnoredReminders(userId, start, end)` counts reminder events in `[start, end)` without `respondedAt`.
 
 ### `src/memories.ts`
@@ -217,6 +252,31 @@ Task creation must not guess a time. If the user does not provide a time, the ag
 - `getRecentMemories(userId, limit = 20)` returns newest memories first.
 
 `Task`, `ReminderEvent`, and `Memory` types plus `ObjectId` are exported from `src/db.ts`.
+
+### `src/analytics.ts`
+
+`AnalyticsResult` contains:
+
+```ts
+interface AnalyticsResult {
+  planned: number;
+  completed: number;
+  skipped: number;
+  incomplete: number;
+  completionRate: number;
+  completedOnTime: number;
+  completedLate: number;
+  ignoredReminders: number;
+  forwarded: number;
+  tasks: Task[];
+}
+```
+
+The analytics query includes tasks created before the period whose scheduled, completed, skipped, or forwarded timestamp falls inside `[start, end)`. Planned tasks are scheduled in the period; incomplete tasks are planned tasks still pending; completion rate is rounded completed/planned percentage and is `0` when no tasks were planned. On-time completion means `completedAt <= scheduledAt`.
+
+Exported functions are `getDayRange`, `getPreviousDayRange`, `getWeekRange` (Monday through Sunday), `getMonthRange` (calendar month), `getAnalytics`, `getDailyAnalytics`, `getWeeklyAnalytics`, `getMonthlyAnalytics`, `getWeeklyTrend` (seven daily rates), and `getMonthlyTrend` (one rate per seven-day segment of the month).
+
+The range helpers currently calculate boundaries using a fixed UTC+5:30 offset even though they accept a timezone argument. This is reliable for the default `Asia/Kolkata` configuration but is not fully generic for other timezones.
 
 ## 10. Reminder Worker
 
@@ -240,7 +300,7 @@ The review date range is generated by `dayRangeIST()`, which formats the current
 
 Users are discovered from tasks that were scheduled or completed today, plus currently due tasks. The current MVP does not send a summary to a user who has only memories and no qualifying task.
 
-Each discovered user receives:
+Each discovered user receives the scheduler's simple review:
 
 - completed task count
 - completed-late count (`completedAt > scheduledAt`)
@@ -249,6 +309,8 @@ Each discovered user receives:
 - unanswered reminder count
 - today's memories, up to 10
 - titles of still-pending tasks, when any exist
+
+This scheduled review is separate from the richer `/summary` command, which uses `src/analytics.ts` and includes task details, timing, carry-forward information, and an insight.
 
 The worker explicitly notes that a restart around the configured minute can send duplicate summaries. No persisted daily-summary delivery record currently prevents duplication.
 
@@ -271,10 +333,11 @@ These are current facts, not promises of existing functionality:
 - Snooze storage logic exists, but no public handler or agent tool calls it.
 - Reminder events are never marked as responded when tasks are completed, skipped, or snoozed.
 - Daily-summary delivery is not persisted, so restart-time duplicates are possible.
-- Daily summary timezone range uses a fixed India offset.
+- Daily summary and analytics timezone ranges use a fixed India offset even when `TIMEZONE` is changed.
 - Recurring tasks, priorities, user settings, weekly reports, and a dashboard are not implemented.
 - There is no explicit validation for empty task titles, empty memory content, malformed numeric configuration, or negative snooze minutes.
 - There is no multi-user authorization layer beyond matching Telegram user IDs in task and memory queries.
+- `.env.example` still contains legacy `OPENAI_API_KEY` and `OPENAI_MODEL` entries; the running implementation requires `GEMINI_API_KEY` and optionally reads `GEMINI_MODEL`.
 
 ## 14. Change Synchronization Rule
 
