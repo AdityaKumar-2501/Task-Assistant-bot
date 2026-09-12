@@ -3,11 +3,14 @@ import http from "node:http";
 
 import { config } from "./config.js";
 import { connectDb } from "./db.js";
-import { handleUserMessage } from "./agent.js";
 import {
   getPendingTasks,
   completeTaskByText,
   skipTaskByText,
+  unskipTaskByText,
+  getSkippedTasks,
+  deleteTaskByText,
+  clearAllPendingTasks,
   createTask
 } from "./tasks.js";
 import { saveMemory, getRecentMemories } from "./memories.js";
@@ -25,49 +28,6 @@ import {
 } from "./analytics.js";
 
 const bot = new Telegraf(config.telegramToken);
-
-/**
- * PER-USER MESSAGE QUEUE
- * ------------------------------------------------------------
- * The natural-language handler doesn't block Telegraf's update
- * loop (see bot.on("text", ...) below), so messages from
- * DIFFERENT users are processed concurrently — that's the point,
- * it's what keeps one slow Gemini call from delaying everyone
- * else.
- *
- * But within a SINGLE user's messages, order still matters (e.g.
- * "add a task" then "clear all tasks" sent seconds apart should
- * run in that order, not race each other). This map holds one
- * promise chain per userId: each new message for a user is
- * appended to that user's chain and only starts once their
- * previous message has finished. Different users get independent
- * chains, so they never wait on each other.
- */
-const userQueues = new Map<number, Promise<void>>();
-
-function enqueueForUser(
-  userId: number,
-  task: () => Promise<void>
-): Promise<void> {
-  const previous = userQueues.get(userId) ?? Promise.resolve();
-
-  // Swallow a previous failure so one bad message doesn't
-  // permanently stall this user's queue.
-  const next = previous.catch(() => {}).then(task);
-
-  userQueues.set(userId, next);
-
-  // Once this task settles, drop the entry if nothing newer has
-  // been queued behind it, so the map doesn't grow forever for
-  // users who go quiet.
-  next.finally(() => {
-    if (userQueues.get(userId) === next) {
-      userQueues.delete(userId);
-    }
-  });
-
-  return next;
-}
 
 
 /**
@@ -514,55 +474,39 @@ Completion rate: ${analytics.completionRate}%
 }
 
 /**
+ * SINGLE SOURCE OF TRUTH for every real command this bot supports.
+ * Used both to populate Telegram's "/" command menu and to detect
+ * unrecognized commands (see bot.on("text", ...) below) — so the
+ * menu and the validation can never drift out of sync.
+ */
+const commandDefinitions: { command: string; description: string }[] = [
+  { command: "start", description: "Start the assistant" },
+  { command: "help", description: "Learn how to use the assistant" },
+  { command: "addtask", description: "Add a task step-by-step" },
+  { command: "canceltask", description: "Cancel an in-progress /addtask" },
+  { command: "tasks", description: "View your pending tasks" },
+  { command: "done", description: "Complete a task" },
+  { command: "skip", description: "Skip a task" },
+  { command: "unskip", description: "Restore a skipped task back to pending" },
+  { command: "skipped", description: "View your skipped tasks" },
+  { command: "delete", description: "Delete a task permanently" },
+  { command: "cleartasks", description: "Delete all pending tasks" },
+  { command: "remember", description: "Remember something" },
+  { command: "memories", description: "View your saved memories" },
+  { command: "summary", description: "Review today's productivity" },
+  { command: "weekly", description: "Review this week's productivity" },
+  { command: "monthly", description: "Review this month's productivity" }
+];
+
+const knownCommands = new Set(
+  commandDefinitions.map(definition => definition.command)
+);
+
+/**
  * Register Telegram's "/" command menu.
  */
 async function setupBotCommands() {
-  await bot.telegram.setMyCommands([
-  {
-    command: "start",
-    description: "Start the assistant",
-  },
-  {
-    command: "help",
-    description: "Learn how to use the assistant",
-  },
-  {
-    command: "addtask",
-    description: "Add a task (menu-based, no AI)",
-  },
-  {
-    command: "tasks",
-    description: "View your pending tasks",
-  },
-  {
-    command: "done",
-    description: "Complete a task",
-  },
-  {
-    command: "skip",
-    description: "Skip a task",
-  },
-  {
-    command: "remember",
-    description: "Remember something",
-  },
-  {
-    command: "memories",
-    description: "View your saved memories",
-  },
-  {
-    command: "summary",
-    description: "Review today's productivity",
-  },
-  {
-    command: "weekly",
-    description: "Review this week's productivity",
-  },
-  {
-    command: "monthly",
-    description: "Review this month's productivity",
-  },
-]);
+  await bot.telegram.setMyCommands(commandDefinitions);
 }
 
 /**
@@ -587,32 +531,21 @@ bot.start(async ctx => {
 
 I’m your personal assistant — here to help you *organize your day, remember important things, and stay on track.*
 
-You can simply talk to me naturally.
+I work entirely through commands (no AI chat) — fast and predictable every time.
 
-For example:
+Use the menu below, or type /help for the full list:
 
-• "Remind me to study DSA at 8 PM"
-• "I finished DSA"
-• "Skip my gym task today"
-• "Remember that I want to focus on System Design"
-• "What do I have planned for today?"
-
-I’ll keep track of your tasks, reminders, progress, and memories for you.
-
-*No need to remember commands — just tell me what you need.*
-
-You can also use the menu below for quick actions:
-
-➕ /addtask — Add a task step-by-step (no AI needed)
+➕ /addtask — Add a task step-by-step
 📋 /tasks — View your tasks
-🧠 /remember — Save something to memory
-💭 /memories — View your memories
 ✅ /done — Complete a task
 ⏭️ /skip — Skip a task
+🗑️ /delete — Delete a task
+🧠 /remember — Save something to memory
+💭 /memories — View your memories
 📊 /summary — View today's summary
-❓ /help — Learn how to use the assistant
+❓ /help — Full list of commands
 
-*Tip:* Type /tasks to see your tasks, or just tell me what you want to do.`,
+*Tip:* Type /tasks to see what's pending, or /addtask to add something new.`,
     {
       parse_mode: "Markdown"
     }
@@ -626,37 +559,35 @@ bot.command("help", async ctx => {
   await ctx.reply(
     `❓ *How to use your personal assistant*
 
-You don't need to use commands. Just talk to me naturally.
+Everything is command-based — type a command and I'll guide you through it if it needs more info.
 
-*Tasks & reminders*
+*Tasks*
 
-• "Remind me to study DSA at 8 PM"
-• "Add a task to prepare for my interview tomorrow"
-• "What are my tasks?"
-• "I finished studying DSA"
-• "Skip my gym task today"
+• /addtask — add a task step-by-step (title, date, time, description)
+• /tasks — view your pending tasks
+• /done \`<task>\` — mark a task complete
+• /skip \`<task>\` — skip a task
+• /skipped — view your skipped tasks
+• /unskip \`<task>\` — restore a skipped task back to pending
+• /delete \`<task>\` — permanently delete a task
+• /cleartasks — permanently delete all pending tasks
 
 *Memories*
 
-• "Remember that I want to focus on System Design"
-• "Remember my preferred study time is 8 PM"
-• "What do you remember about me?"
+• /remember \`<text>\` — save something to memory
+• /memories — view what's been saved
 
 *Daily progress*
 
-• "How did I do today?"
-• "Show me today's summary"
+• /summary — today's productivity summary
+• /weekly — this week's productivity summary
+• /monthly — this month's productivity summary
 
-*Quick commands*
+*Other*
 
-/tasks — View pending tasks
-/done <task> — Complete a task
-/skip <task> — Skip a task
-/remember <text> — Save a memory
-/memories — View saved memories
-/summary — View today's summary
-
-You can always just tell me what you want to do.`,
+• /addtask — add a task step-by-step
+• /canceltask — cancel an in-progress /addtask
+• /start — show the welcome message again`,
     {
       parse_mode: "Markdown"
     }
@@ -838,6 +769,169 @@ bot.command("skip", async ctx => {
 
     await ctx.reply(
       "Sorry, I couldn't skip that task right now. Please try again."
+    );
+  }
+});
+
+/**
+ * /skipped
+ *
+ * Lists tasks currently in the "skipped" state, so the user knows
+ * what title to pass to /unskip.
+ */
+bot.command("skipped", async ctx => {
+  try {
+    const tasks = await getSkippedTasks(ctx.from.id);
+
+    if (!tasks.length) {
+      return ctx.reply("You don't have any skipped tasks.");
+    }
+
+    const taskList = tasks
+      .map((task, index) => {
+        const skippedAt = task.skippedAt
+          ? task.skippedAt.toLocaleString("en-IN", {
+              timeZone: config.timezone,
+              dateStyle: "medium",
+              timeStyle: "short"
+            })
+          : "unknown time";
+
+        return `${index + 1}. *${task.title}*\n   ⏭️ skipped ${skippedAt}`;
+      })
+      .join("\n\n");
+
+    await ctx.reply(
+      `⏭️ *Your skipped tasks*\n\n${taskList}\n\nUse \`/unskip <task>\` to bring one back.`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (error) {
+    console.error("Error fetching skipped tasks:", error);
+
+    await ctx.reply(
+      "Sorry, I couldn't retrieve your skipped tasks right now. Please try again."
+    );
+  }
+});
+
+/**
+ * /unskip <task>
+ *
+ * Restores a skipped task back to "pending" — it reappears in
+ * /tasks and starts getting reminders again. If its original time
+ * has already passed, it's rescheduled to right now.
+ */
+bot.command("unskip", async ctx => {
+  try {
+    const taskText = getCommandArgument(ctx.message.text, "unskip");
+
+    if (!taskText) {
+      return ctx.reply(
+        "Usage:\n\n`/unskip <task>`\n\nExample:\n`/unskip gym today`\n\nTip: use /skipped to see what you can restore.",
+        {
+          parse_mode: "Markdown"
+        }
+      );
+    }
+
+    const task = await unskipTaskByText(ctx.from.id, taskText);
+
+    if (!task) {
+      return ctx.reply(
+        `I couldn't find a skipped task matching "${taskText}". Use /skipped to see your skipped tasks.`
+      );
+    }
+
+    const when = task.scheduledAt.toLocaleString("en-IN", {
+      timeZone: config.timezone,
+      dateStyle: "medium",
+      timeStyle: "short"
+    });
+
+    await ctx.reply(
+      `↩️ *Restored*\n\n${task.title}\n🕐 ${when}`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (error) {
+    console.error("Error unskipping task:", error);
+
+    await ctx.reply(
+      "Sorry, I couldn't restore that task right now. Please try again."
+    );
+  }
+});
+
+/**
+ * /delete <task>
+ *
+ * Permanently deletes a single pending task (unlike /skip, which
+ * just marks it skipped). Previously only reachable by asking the
+ * AI agent to "delete" a task — now a direct command.
+ */
+bot.command("delete", async ctx => {
+  try {
+    const taskText = getCommandArgument(ctx.message.text, "delete");
+
+    if (!taskText) {
+      return ctx.reply(
+        "Usage:\n\n`/delete <task>`\n\nExample:\n`/delete gym today`",
+        {
+          parse_mode: "Markdown"
+        }
+      );
+    }
+
+    const task = await deleteTaskByText(ctx.from.id, taskText);
+
+    if (!task) {
+      return ctx.reply(
+        `I couldn't find a pending task matching "${taskText}".`
+      );
+    }
+
+    await ctx.reply(`🗑️ *Deleted*\n\n${task.title}`, {
+      parse_mode: "Markdown"
+    });
+  } catch (error) {
+    console.error("Error deleting task:", error);
+
+    await ctx.reply(
+      "Sorry, I couldn't delete that task right now. Please try again."
+    );
+  }
+});
+
+/**
+ * /cleartasks
+ *
+ * Permanently deletes ALL pending tasks in one go. Previously only
+ * reachable by asking the AI agent to "clear all tasks" — now a
+ * direct command. Requires typing "/cleartasks confirm" so it can't
+ * be triggered by accident.
+ */
+bot.command("cleartasks", async ctx => {
+  try {
+    const arg = getCommandArgument(ctx.message.text, "cleartasks");
+
+    if (arg.toLowerCase() !== "confirm") {
+      return ctx.reply(
+        '⚠️ This deletes *all* your pending tasks permanently.\n\nTo confirm, send:\n`/cleartasks confirm`',
+        { parse_mode: "Markdown" }
+      );
+    }
+
+    const deletedCount = await clearAllPendingTasks(ctx.from.id);
+
+    await ctx.reply(
+      deletedCount === 0
+        ? "There were no pending tasks to clear."
+        : `🗑️ Deleted ${deletedCount} pending task${deletedCount === 1 ? "" : "s"}.`
+    );
+  } catch (error) {
+    console.error("Error clearing tasks:", error);
+
+    await ctx.reply(
+      "Sorry, I couldn't clear your tasks right now. Please try again."
     );
   }
 });
@@ -1053,13 +1147,28 @@ Completion rate: ${analytics.completionRate}%
 bot.on("text", ctx => {
   const text = ctx.message.text.trim();
 
-  // Ignore commands that were not explicitly handled above.
+  // A "/"-prefixed message reaching this handler means no
+  // bot.command(...) above matched it (a matched command handles
+  // its own reply and doesn't fall through here) — so this is an
+  // unrecognized command. Tell the user instead of staying silent.
   if (text.startsWith("/")) {
+    const commandName = text.slice(1).split(/[\s@]/)[0].toLowerCase();
+
+    if (!knownCommands.has(commandName)) {
+      const commandList = commandDefinitions
+        .map(({ command, description }) => `/${command} — ${description}`)
+        .join("\n");
+
+      void ctx.reply(
+        `❌ *Unknown command:* /${commandName}\n\nHere are the valid commands:\n\n${commandList}`,
+        { parse_mode: "Markdown" }
+      );
+    }
+
     return;
   }
 
   const userId = ctx.from.id;
-  const chatId = ctx.chat.id;
 
   // If the user is mid-way through the manual /addtask flow, treat
   // this text as flow input — never send it to the AI agent.
@@ -1142,28 +1251,11 @@ bot.on("text", ctx => {
     return;
   }
 
-  // Does NOT await: Telegraf's update loop moves on to the next
-  // update immediately. Ordering for THIS user is still guaranteed
-  // by enqueueForUser — see the comment above userQueues.
-  void enqueueForUser(userId, async () => {
-    try {
-      await ctx.sendChatAction("typing");
-
-      const response = await handleUserMessage({
-        userId,
-        chatId,
-        message: text
-      });
-
-      await ctx.reply(response);
-    } catch (error) {
-      console.error("Error handling user message:", error);
-
-      await ctx.reply(
-        "Something went wrong while processing your request. Please try again."
-      );
-    }
-  });
+  // Free text with no active flow: no AI to interpret it, so just
+  // point the user at the command menu instead of trying to guess.
+  void ctx.reply(
+    "I don't understand plain messages anymore — please use a command instead.\n\nType /help to see what I can do, or /addtask to add a task."
+  );
 });
 
 /**

@@ -15,7 +15,9 @@ function required(name: string): string {
 export const config = {
   telegramToken: required("TELEGRAM_BOT_TOKEN"),
 
-  geminiApiKey: required("GEMINI_API_KEY"),
+  // No longer used (AI chat removed) — kept optional so the app
+  // still starts even without this env var set.
+  geminiApiKey: process.env.GEMINI_API_KEY ?? "",
 
   geminiModel:
     process.env.GEMINI_MODEL ?? "gemini-2.5-flash",

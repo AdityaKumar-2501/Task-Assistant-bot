@@ -86,9 +86,10 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export async function findBestTaskForCompletion(
+async function findTaskByStatusAndText(
   userId: number,
-  text: string
+  text: string,
+  status: Task["status"]
 ) {
   const q = text.toLowerCase().trim();
 
@@ -102,7 +103,7 @@ export async function findBestTaskForCompletion(
     .collection<Task>("tasks")
     .find({
       userId,
-      status: "pending",
+      status,
 
       $or: [
         {
@@ -134,6 +135,13 @@ export async function findBestTaskForCompletion(
   );
 
   return exactMatch ?? tasks[0];
+}
+
+export async function findBestTaskForCompletion(
+  userId: number,
+  text: string
+) {
+  return findTaskByStatusAndText(userId, text, "pending");
 }
 
 export async function completeTaskByText(
@@ -186,6 +194,111 @@ export async function skipTaskByText(
         returnDocument: "after",
       }
     );
+}
+
+/**
+ * Restore a skipped task back to "pending" so it shows up in
+ * /tasks and starts getting reminders again.
+ *
+ * If the task's original scheduledAt has already passed (the
+ * common case — you skipped it, some time went by, now you want it
+ * back "today"), we bump scheduledAt to right now so it's
+ * immediately active instead of sitting there permanently overdue.
+ * If it was scheduled in the future, we leave that time as-is.
+ */
+export async function unskipTaskByText(
+  userId: number,
+  text: string
+) {
+  const task = await findTaskByStatusAndText(userId, text, "skipped");
+
+  if (!task?._id) {
+    return null;
+  }
+
+  const scheduledAt =
+    task.scheduledAt.getTime() < Date.now()
+      ? new Date()
+      : task.scheduledAt;
+
+  return db()
+    .collection<Task>("tasks")
+    .findOneAndUpdate(
+      {
+        _id: task._id,
+        userId,
+        status: "skipped",
+      },
+      {
+        $set: {
+          status: "pending",
+          scheduledAt,
+        },
+        $unset: {
+          skippedAt: "",
+        },
+      },
+      {
+        returnDocument: "after",
+      }
+    );
+}
+
+/**
+ * List a user's skipped tasks — useful so they know what title to
+ * pass to /unskip.
+ */
+export async function getSkippedTasks(userId: number) {
+  return db()
+    .collection<Task>("tasks")
+    .find({
+      userId,
+      status: "skipped",
+    })
+    .sort({
+      skippedAt: -1,
+    })
+    .toArray();
+}
+
+/**
+ * Permanently delete a single pending task matched by text.
+ * Uses the same fuzzy match as completeTaskByText/skipTaskByText.
+ */
+export async function deleteTaskByText(
+  userId: number,
+  text: string
+) {
+  const task = await findBestTaskForCompletion(userId, text);
+
+  if (!task?._id) {
+    return null;
+  }
+
+  const result = await db()
+    .collection<Task>("tasks")
+    .deleteOne({
+      _id: task._id,
+      userId, // isolation: only ever deletes this user's own task
+    });
+
+  return result.deletedCount > 0 ? task : null;
+}
+
+/**
+ * Permanently delete ALL of this user's pending tasks in a single
+ * bulk operation (one DB round trip instead of one tool call per
+ * task, which is what made "clear all my tasks" slow before).
+ */
+export async function clearAllPendingTasks(userId: number) {
+  const result = await db()
+    .collection<Task>("tasks")
+    .deleteMany({
+      userId, // isolation: never touches another user's tasks
+      status: "pending",
+    });
+
+  return result.deletedCount;
 }
 
 export async function snoozeTask(
