@@ -1,4 +1,4 @@
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import http from "node:http";
 
 import { config } from "./config.js";
@@ -7,7 +7,8 @@ import { handleUserMessage } from "./agent.js";
 import {
   getPendingTasks,
   completeTaskByText,
-  skipTaskByText
+  skipTaskByText,
+  createTask
 } from "./tasks.js";
 import { saveMemory, getRecentMemories } from "./memories.js";
 import { startSchedulers } from "./reminders.js";
@@ -68,6 +69,294 @@ function enqueueForUser(
   return next;
 }
 
+
+/**
+ * MANUAL "ADD TASK" FLOW (no AI involved)
+ * ------------------------------------------------------------
+ * A guided, button/step based flow for creating a task without
+ * going through Gemini at all — triggered by /addtask from
+ * Telegram's command menu. State is kept per-user in memory while
+ * they're mid-flow; a plain text reply during an active draft is
+ * treated as flow input and never reaches the AI handler below.
+ */
+type TaskDraft =
+  | { step: "title" }
+  | { step: "date"; title: string }
+  | { step: "custom_date"; title: string }
+  | { step: "time"; title: string; dateStr: string }
+  | { step: "description"; title: string; dateStr: string; time: string };
+
+const taskDrafts = new Map<number, TaskDraft>();
+
+/** Today's calendar date (YYYY-MM-DD) as seen in the configured timezone. */
+function todayInTimezone(timeZone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+}
+
+/** Adds N calendar days to a YYYY-MM-DD string (pure date arithmetic). */
+function addDays(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+/** Validates and normalizes a user-typed date like "25/12/2026" or "2026-12-25". */
+function parseDateInput(text: string): string | null {
+  const trimmed = text.trim();
+
+  // YYYY-MM-DD
+  let match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (match) {
+    const [, y, m, d] = match;
+    return isValidDate(Number(y), Number(m), Number(d))
+      ? `${y}-${m}-${d}`
+      : null;
+  }
+
+  // DD/MM/YYYY or DD-MM-YYYY
+  match = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (match) {
+    const [, d, m, y] = match;
+    const dd = d.padStart(2, "0");
+    const mm = m.padStart(2, "0");
+    return isValidDate(Number(y), Number(mm), Number(dd))
+      ? `${y}-${mm}-${dd}`
+      : null;
+  }
+
+  return null;
+}
+
+function isValidDate(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return (
+    dt.getUTCFullYear() === year &&
+    dt.getUTCMonth() === month - 1 &&
+    dt.getUTCDate() === day
+  );
+}
+
+/** Parses a user-typed time like "8pm", "8:30 PM", or "20:30" into 24h "HH:mm". */
+function parseTimeInput(text: string): string | null {
+  const match = text
+    .trim()
+    .toLowerCase()
+    .match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+
+  if (!match) return null;
+
+  let hour = Number(match[1]);
+  const minute = match[2] ? Number(match[2]) : 0;
+  const meridiem = match[3];
+
+  if (minute > 59) return null;
+
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    if (meridiem === "pm" && hour !== 12) hour += 12;
+    if (meridiem === "am" && hour === 12) hour = 0;
+  } else if (hour < 0 || hour > 23) {
+    return null;
+  }
+
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+/**
+ * Converts a wall-clock date + time in the given IANA timezone into
+ * the correct UTC Date instant — works for any timezone (handles
+ * DST correctly), not just fixed-offset ones.
+ */
+function zonedDateTimeToUtc(
+  dateStr: string,
+  time24: string,
+  timeZone: string
+): Date {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  const [hour, minute] = time24.split(":").map(Number);
+
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  })
+    .formatToParts(utcGuess)
+    .reduce<Record<string, string>>((acc, part) => {
+      acc[part.type] = part.value;
+      return acc;
+    }, {});
+
+  const asIfUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour) === 24 ? 0 : Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  );
+
+  const offset = utcGuess.getTime() - asIfUtc;
+
+  return new Date(utcGuess.getTime() + offset);
+}
+
+function formatDateLabel(dateStr: string, timeZone: string): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-IN", {
+    timeZone: "UTC", // dateStr is a plain calendar date, not an instant
+    day: "numeric",
+    month: "short",
+    year: "numeric"
+  });
+}
+
+function dateChoiceKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("Today", "task_date:today"),
+      Markup.button.callback("Tomorrow", "task_date:tomorrow")
+    ],
+    [Markup.button.callback("Custom date", "task_date:custom")],
+    [Markup.button.callback("❌ Cancel", "task_cancel")]
+  ]);
+}
+
+function descriptionChoiceKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Skip", "task_desc:skip")],
+    [Markup.button.callback("❌ Cancel", "task_cancel")]
+  ]);
+}
+
+async function finalizeTaskDraft(
+  ctx: any,
+  draft: { title: string; dateStr: string; time: string },
+  description?: string
+) {
+  const scheduledAt = zonedDateTimeToUtc(
+    draft.dateStr,
+    draft.time,
+    config.timezone
+  );
+
+  const task = await createTask({
+    userId: ctx.from.id,
+    chatId: ctx.chat.id,
+    title: draft.title,
+    scheduledAt: scheduledAt.toISOString(),
+    description
+  });
+
+  const when = formatDateLabel(draft.dateStr, config.timezone);
+  const [hh, mm] = draft.time.split(":").map(Number);
+  const timeLabel = new Date(Date.UTC(2000, 0, 1, hh, mm)).toLocaleTimeString(
+    "en-IN",
+    { timeZone: "UTC", hour: "numeric", minute: "2-digit", hour12: true }
+  );
+
+  await ctx.reply(
+    `✅ *Task created*\n\n*${task.title}*\n🕐 ${when}, ${timeLabel}` +
+      (description ? `\n📝 ${description}` : ""),
+    { parse_mode: "Markdown" }
+  );
+}
+
+/**
+ * /addtask — starts the guided, non-AI task creation flow.
+ */
+bot.command("addtask", async ctx => {
+  taskDrafts.set(ctx.from.id, { step: "title" });
+
+  await ctx.reply(
+    "📝 Let's add a task.\n\nWhat's the task title?\n\n_(Send /canceltask anytime to cancel.)_",
+    { parse_mode: "Markdown" }
+  );
+});
+
+/**
+ * /canceltask — aborts an in-progress draft.
+ */
+bot.command("canceltask", async ctx => {
+  const hadDraft = taskDrafts.delete(ctx.from.id);
+
+  await ctx.reply(
+    hadDraft ? "Cancelled." : "You don't have a task in progress."
+  );
+});
+
+bot.action("task_cancel", async ctx => {
+  taskDrafts.delete(ctx.from.id);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Cancelled.");
+});
+
+bot.action(/^task_date:(today|tomorrow|custom)$/, async ctx => {
+  const draft = taskDrafts.get(ctx.from.id);
+
+  if (!draft || draft.step !== "date") {
+    await ctx.answerCbQuery("This step has expired.");
+    return;
+  }
+
+  const choice = ctx.match[1];
+  await ctx.answerCbQuery();
+
+  if (choice === "custom") {
+    taskDrafts.set(ctx.from.id, { step: "custom_date", title: draft.title });
+    await ctx.editMessageText(
+      "Enter the date (DD/MM/YYYY or YYYY-MM-DD):"
+    );
+    return;
+  }
+
+  const dateStr =
+    choice === "today"
+      ? todayInTimezone(config.timezone)
+      : addDays(todayInTimezone(config.timezone), 1);
+
+  taskDrafts.set(ctx.from.id, {
+    step: "time",
+    title: draft.title,
+    dateStr
+  });
+
+  await ctx.editMessageText(
+    `Date: ${formatDateLabel(dateStr, config.timezone)}\n\nWhat time? (e.g. "8pm" or "20:00")`
+  );
+});
+
+bot.action("task_desc:skip", async ctx => {
+  const draft = taskDrafts.get(ctx.from.id);
+
+  if (!draft || draft.step !== "description") {
+    await ctx.answerCbQuery("This step has expired.");
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  taskDrafts.delete(ctx.from.id);
+
+  try {
+    await finalizeTaskDraft(ctx, draft);
+  } catch (error) {
+    console.error("Error creating task:", error);
+    await ctx.reply("Sorry, something went wrong creating that task.");
+  }
+});
 
 function formatTime(date: Date) {
   return new Intl.DateTimeFormat(
@@ -238,6 +527,10 @@ async function setupBotCommands() {
     description: "Learn how to use the assistant",
   },
   {
+    command: "addtask",
+    description: "Add a task (menu-based, no AI)",
+  },
+  {
     command: "tasks",
     description: "View your pending tasks",
   },
@@ -310,6 +603,7 @@ I’ll keep track of your tasks, reminders, progress, and memories for you.
 
 You can also use the menu below for quick actions:
 
+➕ /addtask — Add a task step-by-step (no AI needed)
 📋 /tasks — View your tasks
 🧠 /remember — Save something to memory
 💭 /memories — View your memories
@@ -766,6 +1060,87 @@ bot.on("text", ctx => {
 
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
+
+  // If the user is mid-way through the manual /addtask flow, treat
+  // this text as flow input — never send it to the AI agent.
+  const draft = taskDrafts.get(userId);
+
+  if (draft) {
+    void (async () => {
+      try {
+        if (draft.step === "title") {
+          if (!text) {
+            await ctx.reply("Title can't be empty. What's the task title?");
+            return;
+          }
+
+          taskDrafts.set(userId, { step: "date", title: text });
+          await ctx.reply("When is it due?", dateChoiceKeyboard());
+          return;
+        }
+
+        if (draft.step === "custom_date") {
+          const dateStr = parseDateInput(text);
+
+          if (!dateStr) {
+            await ctx.reply(
+              "Couldn't read that date. Try DD/MM/YYYY or YYYY-MM-DD:"
+            );
+            return;
+          }
+
+          taskDrafts.set(userId, {
+            step: "time",
+            title: draft.title,
+            dateStr
+          });
+
+          await ctx.reply(
+            `Date: ${formatDateLabel(dateStr, config.timezone)}\n\nWhat time? (e.g. "8pm" or "20:00")`
+          );
+          return;
+        }
+
+        if (draft.step === "time") {
+          const time = parseTimeInput(text);
+
+          if (!time) {
+            await ctx.reply(
+              'Couldn\'t read that time. Try something like "8pm" or "20:00":'
+            );
+            return;
+          }
+
+          taskDrafts.set(userId, {
+            step: "description",
+            title: draft.title,
+            dateStr: draft.dateStr,
+            time
+          });
+
+          await ctx.reply(
+            "Add a description? Send it now, or tap Skip.",
+            descriptionChoiceKeyboard()
+          );
+          return;
+        }
+
+        if (draft.step === "description") {
+          taskDrafts.delete(userId);
+          await finalizeTaskDraft(ctx, draft, text);
+          return;
+        }
+      } catch (error) {
+        console.error("Error in add-task flow:", error);
+        taskDrafts.delete(userId);
+        await ctx.reply(
+          "Something went wrong creating that task. Please try /addtask again."
+        );
+      }
+    })();
+
+    return;
+  }
 
   // Does NOT await: Telegraf's update loop moves on to the next
   // update immediately. Ordering for THIS user is still guaranteed
